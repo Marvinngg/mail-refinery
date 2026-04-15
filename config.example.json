@@ -1,0 +1,27 @@
+{
+  "account": {
+    "name": "work",
+    "email": "your@email.com",
+    "password": "your-password-or-auth-code",
+    "imap": {
+      "host": "imap.your-provider.com",
+      "port": 993,
+      "tls": true
+    },
+    "smtp": {
+      "host": "smtp.your-provider.com",
+      "port": 465,
+      "tls": true
+    }
+  },
+  "sync": {
+    "folders_skip": ["草稿箱", "已删除"],
+    "initial_days": 30,
+    "attachment_retention_days": 30
+  },
+  "model": {
+    "base_url": "http://localhost:8090/v1",
+    "api_key": "none",
+    "model_name": "Qwen3.5-9B-Q4_K_M.gguf"
+  }
+}
