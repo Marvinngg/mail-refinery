@@ -108,20 +108,20 @@ function rebuildState() {
   return true;
 }
 
-function main() {
+const INTERVAL_MS = 5 * 60 * 1000; // 5 分钟
+
+function runOnce() {
   log('========== 开始 ==========');
 
   // 同步
   if (!run('node sync.js')) {
-    log('同步失败，退出');
-    process.exit(1);
+    log('同步失败，跳过本轮处理');
+    return;
   }
 
   // 判断模式
   if (hasEventsContent()) {
-    // 有已有结果
     if (!isStateValid()) {
-      // state 缺失/损坏 → 重建
       rebuildState();
     }
     log('模式: 增量');
@@ -129,7 +129,6 @@ function main() {
       log('增量处理失败');
     }
   } else {
-    // 无已有结果 → 全量
     log('模式: 全量');
     if (!run('node process.js')) {
       log('全量处理失败');
@@ -139,4 +138,17 @@ function main() {
   log('========== 完成 ==========');
 }
 
-main();
+// 服务模式：循环执行，每轮间隔 5 分钟
+function service() {
+  log('服务启动，间隔 ' + (INTERVAL_MS / 1000 / 60) + ' 分钟');
+
+  const loop = () => {
+    runOnce();
+    log(`下一轮: ${new Date(Date.now() + INTERVAL_MS).toISOString().slice(0, 19)}`);
+    setTimeout(loop, INTERVAL_MS);
+  };
+
+  loop();
+}
+
+service();
