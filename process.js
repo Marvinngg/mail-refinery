@@ -217,18 +217,35 @@ ${threadList}
 
   // 合并步骤：分批处理可能产生同一项目的不同命名，让模型合并
   if (allProjects.length > 3) {
-    const projectList = allProjects.map((p, i) =>
-      `${i + 1}. 项目「${p.project}」话题: ${p.topics.map(t => t.name).join('、')}`
-    ).join('\n');
+    // 给合并步骤有效信息：话题描述 + 参与者 + 时间范围（不给邮件数，没有判断价值）
+    const projectList = allProjects.map((p, i) => {
+      const topicDetails = p.topics.map(t => {
+        const tids = t.thread_ids;
+        const placeholders = tids.map(() => '?').join(',');
+        const stats = tids.length > 0 ? db.prepare(`
+          SELECT GROUP_CONCAT(DISTINCT from_name) as people,
+                 MIN(date) as first, MAX(date) as last
+          FROM emails WHERE thread_id IN (${placeholders})
+        `).get(...tids) : {};
+        return `    - ${t.name}: ${t.description || ''}\n      参与者: ${stats.people || '?'} | 时间: ${stats.first?.slice(0,10) || '?'}~${stats.last?.slice(0,10) || '?'}`;
+      }).join('\n');
+      return `${i + 1}. 项目「${p.project}」\n${topicDetails}`;
+    }).join('\n\n');
 
-    const mergePrompt = `以下是从邮件中识别出的项目列表。有些项目可能实际上是同一个项目的不同方面（如"大成温调"和"大成AI系统"其实是同一个项目）。
+    const mergePrompt = `以下是从邮件中识别出的项目列表。请合并：
 
+1. 同一业务不同命名的项目合并为一个（判断依据：参与者重叠、话题相关、时间重叠）
+2. 非业务类的零散项目（通知、提醒、账单、行政等）合并为一个"通知与杂项"
+
+原则：最终项目数量要精简。合并后通常是若干个业务项目 + 一个非业务项目。
+
+项目列表：
 ${projectList}
 
-请判断哪些项目应该合并，返回合并方案。格式：
-[{"merged_name":"合并后的项目名","original_indices":[1,2,3]}]
+返回合并方案（JSON数组）：
+[{"merged_name":"合并后名称","original_indices":[1,2,3]}]
 
-如果某个项目不需要合并，也要列出（original_indices只有自己）。所有项目都必须出现。`;
+所有项目都必须出现在某个合并组中。`;
 
     console.log(`  项目合并检查 (${allProjects.length} 个项目)...`);
     try {
@@ -289,14 +306,50 @@ async function generateEventMd(db, folder, projectName, topic) {
 
   if (emails.length === 0) return null;
 
-  // 收集每封邮件的 turn_index=0 + 附件内容
+  // 收集每封邮件的内容 + 附件
+  // 关键逻辑：回复链中间的邮件只取 turn_index=0（新增内容）
+  //          链首/转发/独立邮件取所有 turn（引用内容在别处没有）
   const entries = [];
   for (const email of emails) {
-    const turn0 = db.prepare(`
-      SELECT content FROM email_turns WHERE email_id = ? AND turn_index = 0
-    `).get(email.id);
-
     const direction = email.folder === '已发送' ? '[发件]' : '[收件]';
+    const isForward = /^(Fw:|Fwd:|转发[:：])/i.test(email.subject || '');
+    const isChainHead = !db.prepare('SELECT 1 FROM emails WHERE message_id = ?').get(email.in_reply_to || '');
+    const needAllTurns = isForward || isChainHead;
+
+    let emailContent = '';
+    if (needAllTurns) {
+      // 取所有轮次（转发/链首/独立邮件，引用内容也重要）
+      const allTurns = db.prepare(`
+        SELECT turn_index, from_name, date, content FROM email_turns
+        WHERE email_id = ? ORDER BY turn_index ASC
+      `).all(email.id);
+
+      if (allTurns.length > 1) {
+        emailContent = allTurns.map(t =>
+          t.turn_index === 0
+            ? t.content
+            : `[引用 ${t.from_name || '?'} ${t.date?.slice(0, 10) || ''}] ${t.content}`
+        ).join('\n\n');
+      } else {
+        emailContent = allTurns[0]?.content || '(无正文)';
+      }
+    } else {
+      // 回复链中间：只取新增内容
+      const turn0 = db.prepare(`
+        SELECT content FROM email_turns WHERE email_id = ? AND turn_index = 0
+      `).get(email.id);
+      emailContent = turn0?.content || '(无正文)';
+    }
+
+    // 分割质量检查：如果 turn 只有 1 个且原始正文很长，说明分割可能失败
+    // 原始正文里有明显的引用特征但没被拆分 → 给模型的输入里标注"可能包含未拆分的引用内容"
+    const rawBody = db.prepare('SELECT body_raw FROM emails WHERE id = ?').get(email.id)?.body_raw || '';
+    const hasQuoteMarkers = /^(From:|发件人:|差出人:|On .+ wrote:)/m.test(rawBody);
+    const turnCount = db.prepare('SELECT COUNT(*) as c FROM email_turns WHERE email_id = ?').get(email.id)?.c || 0;
+    if (turnCount <= 1 && hasQuoteMarkers && rawBody.length > 500) {
+      // 代码分割不充分，把原始正文给模型，让它自己识别对话结构
+      emailContent = `[注意：以下正文包含未拆分的引用/转发内容，请识别其中的对话结构]\n${rawBody.slice(0, 3000)}`;
+    }
 
     // 提取附件内容
     let attachInfo = '';
@@ -306,16 +359,16 @@ async function generateEventMd(db, folder, projectName, topic) {
       for (const att of atts) {
         const content = extractAttachmentContent(att.local_path, att.name);
         if (content) {
-          attDetails.push(`📎 ${att.name} (${Math.round((att.size || 0) / 1024)}KB)\n内容摘要: ${content.slice(0, 500)}`);
+          attDetails.push(`📎 ${att.name} (${Math.round((att.size || 0) / 1024)}KB) [${att.local_path || ''}]\n内容摘要: ${content.slice(0, 500)}`);
         } else {
-          attDetails.push(`📎 ${att.name} (${Math.round((att.size || 0) / 1024)}KB) [${att.local_path ? '需手动查看: ' + att.local_path : '无法提取'}]`);
+          attDetails.push(`📎 ${att.name} (${Math.round((att.size || 0) / 1024)}KB) [${att.local_path ? '查看: ' + att.local_path : '无法提取'}]`);
         }
       }
       attachInfo = '\n' + attDetails.join('\n');
     }
 
     entries.push(
-      `[${email.date?.slice(0, 10)}] ${email.from_name || email.from_addr} ${direction}:\n${turn0?.content || '(无正文)'}${attachInfo}`
+      `[${email.date?.slice(0, 10)}] ${email.from_name || email.from_addr} ${direction}:\n${emailContent}${attachInfo}`
     );
   }
 
