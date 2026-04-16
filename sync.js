@@ -276,49 +276,28 @@ async function sync() {
             fs.mkdirSync(attachDir, { recursive: true });
           }
 
-          const SMALL_ATTACHMENT_LIMIT = 5 * 1024 * 1024; // 5MB
           const attachmentsMeta = [];
-          const bigAttachmentQueue = []; // 大附件延后下载
-
           for (const att of attachments) {
             const localPath = path.join(attachDir, att.filename);
-
-            if (att.size && att.size > SMALL_ATTACHMENT_LIMIT) {
-              // 大附件：先记录元信息，不下载，后台处理
+            try {
+              const buf = await downloadPart(client, uid, att.part);
+              if (buf) {
+                fs.writeFileSync(localPath, buf);
+                attachmentsMeta.push({
+                  name: att.filename,
+                  type: att.mimeType,
+                  size: buf.length,
+                  local_path: localPath
+                });
+              }
+            } catch (e) {
               attachmentsMeta.push({
                 name: att.filename,
                 type: att.mimeType,
                 size: att.size,
                 local_path: null,
-                pending: true,
-                _part: att.part,
-                _uid: uid,
-                _folder: folderPath,
-                _localPath: localPath
+                error: e.message.slice(0, 60)
               });
-              bigAttachmentQueue.push({ uid, part: att.part, localPath, meta_index: attachmentsMeta.length - 1 });
-            } else {
-              // 小附件：立即下载
-              try {
-                const buf = await downloadPart(client, uid, att.part);
-                if (buf) {
-                  fs.writeFileSync(localPath, buf);
-                  attachmentsMeta.push({
-                    name: att.filename,
-                    type: att.mimeType,
-                    size: buf.length,
-                    local_path: localPath
-                  });
-                }
-              } catch (e) {
-                attachmentsMeta.push({
-                  name: att.filename,
-                  type: att.mimeType,
-                  size: att.size,
-                  local_path: null,
-                  error: e.message.slice(0, 60)
-                });
-              }
             }
           }
 
@@ -388,69 +367,7 @@ async function sync() {
     }
   }
 
-  // 4. 后台下载大附件（不阻塞主流程，主流程已结束邮件入库）
-  const pendingAttachments = db.prepare(`
-    SELECT id, uid, folder, attachments FROM emails
-    WHERE attachments LIKE '%"pending":true%'
-  `).all();
-
-  if (pendingAttachments.length > 0) {
-    console.log(`\n后台下载 ${pendingAttachments.length} 封邮件的大附件...`);
-
-    // 重新连接 IMAP（之前的 lock 已释放）
-    const dlClient = new ImapFlow({
-      host: config.account.imap.host,
-      port: config.account.imap.port,
-      secure: config.account.imap.tls,
-      auth: { user: config.account.email, pass: config.account.password },
-      logger: false
-    });
-    await dlClient.connect();
-
-    for (const email of pendingAttachments) {
-      const atts = JSON.parse(email.attachments || '[]');
-      let updated = false;
-
-      for (const att of atts) {
-        if (!att.pending) continue;
-        try {
-          const lock = await dlClient.getMailboxLock(email.folder);
-          try {
-            const buf = await downloadPart(dlClient, email.uid, att._part);
-            if (buf) {
-              const dir = path.dirname(att._localPath);
-              fs.mkdirSync(dir, { recursive: true });
-              fs.writeFileSync(att._localPath, buf);
-              att.local_path = att._localPath;
-              att.size = buf.length;
-              delete att.pending;
-              delete att._part;
-              delete att._uid;
-              delete att._folder;
-              delete att._localPath;
-              updated = true;
-              console.log(`  ✓ [UID:${email.uid}] ${att.name} (${Math.round(buf.length / 1024 / 1024)}MB)`);
-            }
-          } finally {
-            lock.release();
-          }
-        } catch (e) {
-          console.log(`  ✗ [UID:${email.uid}] ${att.name}: ${e.message.slice(0, 60)}`);
-          att.error = e.message.slice(0, 60);
-          delete att.pending;
-          updated = true;
-        }
-      }
-
-      if (updated) {
-        db.prepare('UPDATE emails SET attachments = ? WHERE id = ?').run(JSON.stringify(atts), email.id);
-      }
-    }
-
-    await dlClient.logout();
-  }
-
-  // 5. 更新 contacts 聚合表
+  // 4. 更新 contacts 聚合表
   console.log('更新联系人聚合...');
   db.exec(`
     INSERT OR REPLACE INTO contacts (addr, name, last_email_at, email_count, folders)

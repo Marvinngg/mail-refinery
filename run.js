@@ -20,10 +20,10 @@ function log(msg) {
   console.log(`[${new Date().toISOString().slice(0, 19)}] ${msg}`);
 }
 
-function run(cmd, timeoutMs = 3600000) { // 默认 1 小时
+function run(cmd) {
   log(`执行: ${cmd}`);
   try {
-    execSync(cmd, { cwd: __dirname, stdio: 'inherit', timeout: timeoutMs });
+    execSync(cmd, { cwd: __dirname, stdio: 'inherit' }); // 无超时，跑完为止
     return true;
   } catch (e) {
     log(`失败: ${e.message.slice(0, 100)}`);
