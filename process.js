@@ -215,78 +215,6 @@ ${threadList}
     }
   }
 
-  // 合并步骤：分批处理可能产生同一项目的不同命名，让模型合并
-  if (allProjects.length > 3) {
-    // 给合并步骤有效信息：话题描述 + 参与者 + 时间范围（不给邮件数，没有判断价值）
-    const projectList = allProjects.map((p, i) => {
-      const topicDetails = p.topics.map(t => {
-        const tids = t.thread_ids;
-        const placeholders = tids.map(() => '?').join(',');
-        const stats = tids.length > 0 ? db.prepare(`
-          SELECT GROUP_CONCAT(DISTINCT from_name) as people,
-                 MIN(date) as first, MAX(date) as last
-          FROM emails WHERE thread_id IN (${placeholders})
-        `).get(...tids) : {};
-        return `    - ${t.name}: ${t.description || ''}\n      参与者: ${stats.people || '?'} | 时间: ${stats.first?.slice(0,10) || '?'}~${stats.last?.slice(0,10) || '?'}`;
-      }).join('\n');
-      return `${i + 1}. 项目「${p.project}」\n${topicDetails}`;
-    }).join('\n\n');
-
-    const mergePrompt = `以下是从邮件中识别出的项目列表。请合并：
-
-1. 同一业务不同命名的项目合并为一个（判断依据：参与者重叠、话题相关、时间重叠）
-2. 非业务类的零散项目（通知、提醒、账单、行政等）合并为一个"通知与杂项"
-
-原则：最终项目数量要精简。合并后通常是若干个业务项目 + 一个非业务项目。
-
-项目列表：
-${projectList}
-
-返回合并方案（JSON数组）：
-[{"merged_name":"合并后名称","original_indices":[1,2,3]}]
-
-所有项目都必须出现在某个合并组中。`;
-
-    console.log(`  项目合并检查 (${allProjects.length} 个项目)...`);
-    try {
-      const mergeResponse = await callModel(mergePrompt);
-      const mergeResult = parseJSON(mergeResponse);
-
-      const mergedProjects = [];
-      for (const merge of mergeResult) {
-        const combined = { project: merge.merged_name, topics: [] };
-        for (const idx of merge.original_indices) {
-          const orig = allProjects[idx - 1];
-          if (orig) combined.topics.push(...orig.topics);
-        }
-        if (combined.topics.length > 0) mergedProjects.push(combined);
-      }
-
-      if (mergedProjects.length > 0) {
-        // 话题去重：同一项目内相同名称的话题合并 thread_ids
-        for (const p of mergedProjects) {
-          const topicMap = new Map();
-          for (const t of p.topics) {
-            const existing = topicMap.get(t.name);
-            if (existing) {
-              existing.thread_ids.push(...t.thread_ids);
-              if (t.description.length > existing.description.length) {
-                existing.description = t.description;
-              }
-            } else {
-              topicMap.set(t.name, { ...t });
-            }
-          }
-          p.topics = [...topicMap.values()];
-        }
-        console.log(`  合并: ${allProjects.length} → ${mergedProjects.length} 个项目`);
-        return mergedProjects;
-      }
-    } catch (e) {
-      console.log(`  合并失败，使用原始分组: ${e.message.slice(0, 60)}`);
-    }
-  }
-
   return allProjects;
 }
 
@@ -372,6 +300,19 @@ async function generateEventMd(db, folder, projectName, topic) {
     );
   }
 
+  // 控制输入长度：每封邮件的内容截取，总量不超过 ~20K 字符（留空间给 prompt 和输出）
+  const MAX_TOTAL_CHARS = 20000;
+  let totalChars = 0;
+  const trimmedEntries = [];
+  for (const entry of entries) {
+    if (totalChars + entry.length > MAX_TOTAL_CHARS) {
+      trimmedEntries.push(`[... 更早的 ${entries.length - trimmedEntries.length} 封邮件省略，共 ${entries.length} 封]`);
+      break;
+    }
+    trimmedEntries.push(entry);
+    totalChars += entry.length;
+  }
+
   const prompt = `你是邮件分析助手。以下是项目「${projectName}」中话题「${topic.name}」的所有邮件记录。
 每封邮件只包含新增内容（已去除引用链）。附件已提取内容摘要。
 
@@ -382,8 +323,8 @@ async function generateEventMd(db, folder, projectName, topic) {
 文件夹: ${folder}
 邮件数: ${emails.length}
 
-邮件记录（倒序）：
-${entries.join('\n\n---\n\n')}
+邮件记录（倒序，最新的在前）：
+${trimmedEntries.join('\n\n---\n\n')}
 
 直接输出 markdown（不要 \`\`\`markdown 包裹）：
 
@@ -518,10 +459,9 @@ async function main() {
     console.log(`处理文件夹: ${folder}`);
     console.log('='.repeat(50));
 
-    // 步骤 1: 项目+话题识别
+    // 步骤 1: 项目+话题识别（分批，不含合并）
     console.log('\n[步骤1] 项目与话题识别');
     const projects = await identifyProjectsAndTopics(db, folder);
-    allFolderProjects[folder] = projects;
 
     console.log(`  识别出 ${projects.length} 个项目:`);
     for (const p of projects) {
@@ -531,7 +471,7 @@ async function main() {
       }
     }
 
-    // 步骤 2: 生成 event.md
+    // 步骤 2: 生成 event.md（先生成内容，合并判断需要用）
     console.log('\n[步骤2] 事件文档生成（含附件内容）');
     for (const project of projects) {
       for (const topic of project.topics) {
@@ -546,8 +486,8 @@ async function main() {
       }
     }
 
-    // 步骤 3: 生成索引
-    console.log('\n[步骤3] 索引生成');
+    // 步骤 3: 生成项目级 _index.md（合并判断需要用）
+    console.log('\n[步骤3] 项目索引生成');
     for (const project of projects) {
       const projectDir = path.join(EVENTS_DIR, folder, project.project);
       fs.mkdirSync(projectDir, { recursive: true });
@@ -556,7 +496,120 @@ async function main() {
       console.log(`    ✓ ${project.project}/_index.md`);
     }
 
-    const folderIndexMd = generateFolderIndex(db, folder, projects);
+    // 步骤 4: 项目合并（基于已生成的 _index.md 内容判断）
+    let finalProjects = projects;
+    if (projects.length > 3) {
+      console.log('\n[步骤4] 项目合并判断');
+
+      // 读取每个项目的 _index.md 内容（截取前 300 行）作为合并判断依据
+      const projectSummaries = projects.map((p, i) => {
+        const indexPath = path.join(EVENTS_DIR, folder, p.project, '_index.md');
+        let content = '';
+        if (fs.existsSync(indexPath)) {
+          const lines = fs.readFileSync(indexPath, 'utf-8').split('\n');
+          content = lines.slice(0, 100).join('\n');
+        }
+        return `${i + 1}. 项目「${p.project}」\n${content}`;
+      }).join('\n\n---\n\n');
+
+      const mergePrompt = `以下是同一个邮件文件夹中识别出的多个项目及其内容索引。请判断是否有项目应该合并：
+
+1. 同一业务不同命名的项目合并为一个（判断依据：参与者重叠、话题相关、时间重叠）
+2. 非业务类的零散项目合并为一个"通知与杂项"
+
+原则：最终项目数量要精简。合并后通常是若干个业务项目 + 一个非业务项目。
+
+${projectSummaries}
+
+返回合并方案（JSON数组）：
+[{"merged_name":"合并后名称","original_indices":[1,2,3]}]
+
+所有项目都必须出现在某个合并组中。`;
+
+      try {
+        const mergeResponse = await callModel(mergePrompt);
+        const mergeResult = parseJSON(mergeResponse);
+
+        const mergedProjects = [];
+        for (const merge of mergeResult) {
+          const combined = { project: merge.merged_name, topics: [] };
+          for (const idx of merge.original_indices) {
+            const orig = projects[idx - 1];
+            if (orig) combined.topics.push(...orig.topics);
+          }
+          if (combined.topics.length > 0) mergedProjects.push(combined);
+        }
+
+        if (mergedProjects.length > 0 && mergedProjects.length < projects.length) {
+          // 话题去重
+          for (const p of mergedProjects) {
+            const topicMap = new Map();
+            for (const t of p.topics) {
+              const existing = topicMap.get(t.name);
+              if (existing) {
+                existing.thread_ids.push(...t.thread_ids);
+              } else {
+                topicMap.set(t.name, { ...t });
+              }
+            }
+            p.topics = [...topicMap.values()];
+          }
+
+          console.log(`  合并: ${projects.length} → ${mergedProjects.length} 个项目`);
+
+          // 重新组织文件夹结构：移动被合并项目的文件
+          for (const mp of mergedProjects) {
+            const mergedDir = path.join(EVENTS_DIR, folder, mp.project);
+            fs.mkdirSync(mergedDir, { recursive: true });
+
+            for (const topic of mp.topics) {
+              // 检查话题文件夹是否已在正确位置
+              const targetDir = path.join(mergedDir, topic.name);
+              if (fs.existsSync(targetDir)) continue;
+
+              // 从原项目目录找到并移动
+              for (const origP of projects) {
+                const srcDir = path.join(EVENTS_DIR, folder, origP.project, topic.name);
+                if (fs.existsSync(srcDir)) {
+                  fs.mkdirSync(targetDir, { recursive: true });
+                  // 复制 event.md
+                  const srcEvent = path.join(srcDir, 'event.md');
+                  if (fs.existsSync(srcEvent)) {
+                    fs.copyFileSync(srcEvent, path.join(targetDir, 'event.md'));
+                  }
+                  break;
+                }
+              }
+            }
+
+            // 重新生成合并后的 _index.md
+            const indexMd = generateProjectIndex(db, folder, mp.project, mp.topics);
+            fs.writeFileSync(path.join(mergedDir, '_index.md'), indexMd, 'utf-8');
+          }
+
+          // 删除被合并掉的旧项目文件夹
+          for (const origP of projects) {
+            const isKept = mergedProjects.some(mp => mp.project === origP.project);
+            if (!isKept) {
+              const oldDir = path.join(EVENTS_DIR, folder, origP.project);
+              if (fs.existsSync(oldDir)) {
+                fs.rmSync(oldDir, { recursive: true, force: true });
+              }
+            }
+          }
+
+          finalProjects = mergedProjects;
+        }
+      } catch (e) {
+        console.log(`  合并失败，保持原分组: ${e.message.slice(0, 60)}`);
+      }
+    }
+
+    allFolderProjects[folder] = finalProjects;
+
+    // 步骤 5: 生成文件夹级索引
+    console.log('\n[步骤5] 文件夹索引生成');
+    const folderIndexMd = generateFolderIndex(db, folder, finalProjects);
     fs.writeFileSync(path.join(EVENTS_DIR, folder, '_index.md'), folderIndexMd, 'utf-8');
     console.log(`    ✓ ${folder}/_index.md`);
   }
