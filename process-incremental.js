@@ -18,7 +18,7 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 
-const { callModel, parseJSON } = require('./lib/model');
+const { callModel, parseJSON, sanitizeName } = require('./lib/model');
 const { FILTER_RULES } = require('./lib/filter');
 const { buildEmailEntry } = require('./lib/email-content');
 const {

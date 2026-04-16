@@ -17,7 +17,7 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 
-const { callModel, parseJSON } = require('./lib/model');
+const { callModel, parseJSON, sanitizeName } = require('./lib/model');
 const { FILTER_RULES } = require('./lib/filter');
 const {
   EVENTS_DIR,
@@ -103,14 +103,15 @@ ${threadList}
     const batchProjects = parseJSON(response);
 
     for (const project of batchProjects) {
-      let existing = allProjects.find(p => p.project === project.project);
+      const projectName = sanitizeName(project.project);
+      let existing = allProjects.find(p => p.project === projectName);
       if (!existing) {
-        existing = { project: project.project, topics: [] };
+        existing = { project: projectName, topics: [] };
         allProjects.push(existing);
       }
       for (const topic of project.topics) {
         existing.topics.push({
-          name: topic.name,
+          name: sanitizeName(topic.name),
           description: topic.description,
           thread_ids: topic.thread_indices.map(j => batch[j - 1]?.thread_id).filter(Boolean)
         });
