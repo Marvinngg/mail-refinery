@@ -270,9 +270,6 @@ ${summaries}
 
     console.log(`  合并完成: ${projects.length} → ${current.length}`);
     return current;
-    }
-  } catch (e) {
-    console.log(`  合并失败: ${e.message.slice(0, 60)}`);
   }
 
   return projects;
