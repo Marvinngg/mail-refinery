@@ -98,9 +98,19 @@ ${threadList}
 
 规则：项目名和话题名用中文，不含特殊字符。每个线程只归入一个话题。所有线程都必须归入。`;
 
-    console.log(`  批次 ${Math.floor(i / BATCH_SIZE) + 1}: ${batch.length} 条线程...`);
-    const response = await callModel(prompt);
-    const batchProjects = parseJSON(response);
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    console.log(`  批次 ${batchNum}: ${batch.length} 条线程...`);
+
+    let batchProjects;
+    while (true) {
+      try {
+        const response = await callModel(prompt);
+        batchProjects = parseJSON(response);
+        break;
+      } catch (e) {
+        console.log(`  批次 ${batchNum} JSON 解析失败，重试: ${e.message.slice(0, 60)}`);
+      }
+    }
 
     for (const project of batchProjects) {
       const projectName = sanitizeName(project.project);
@@ -129,86 +139,137 @@ ${threadList}
 async function mergeProjects(db, folder, projects) {
   if (projects.length <= 3) return projects;
 
-  const projectSummaries = projects.map((p, i) => {
-    const indexPath = path.join(EVENTS_DIR, folder, p.project, '_index.md');
-    let content = '';
-    if (fs.existsSync(indexPath)) {
-      content = fs.readFileSync(indexPath, 'utf-8').split('\n').slice(0, 100).join('\n');
-    }
-    return `${i + 1}. 项目「${p.project}」\n${content}`;
-  }).join('\n\n---\n\n');
+  const MERGE_BATCH = 30;
 
-  const prompt = `以下是同一个邮件文件夹中识别出的多个项目及其内容索引。请判断是否有项目应该合并：
+  // 单批合并：给定一组项目，调模型合并，返回合并后的项目列表
+  async function mergeBatch(batchProjects, batchLabel) {
+    const summaries = batchProjects.map((p, i) => {
+      const indexPath = path.join(EVENTS_DIR, folder, p.project, '_index.md');
+      let content = '';
+      if (fs.existsSync(indexPath)) {
+        content = fs.readFileSync(indexPath, 'utf-8').split('\n').slice(0, 100).join('\n');
+      }
+      return `${i + 1}. 项目「${p.project}」\n${content}`;
+    }).join('\n\n---\n\n');
+
+    const prompt = `以下是同一个邮件文件夹中识别出的多个项目及其内容索引。请判断是否有项目应该合并：
 
 1. 同一业务不同命名的项目合并为一个（判断依据：参与者重叠、话题相关、时间重叠）
 2. 非业务类的零散项目合并为一个"通知与杂项"
 
 原则：最终项目数量要精简。
 
-${projectSummaries}
+${summaries}
 
 返回合并方案（JSON数组）：
 [{"merged_name":"合并后名称","original_indices":[1,2,3]}]
 
 所有项目都必须出现在某个合并组中。`;
 
-  console.log(`  项目合并判断 (${projects.length} 个)...`);
-  try {
-    const response = await callModel(prompt);
-    const mergeResult = parseJSON(response);
+    let mergeResult;
+    while (true) {
+      try {
+        const response = await callModel(prompt);
+        mergeResult = parseJSON(response);
+        break;
+      } catch (e) {
+        console.log(`  ${batchLabel} JSON 解析失败，重试: ${e.message.slice(0, 60)}`);
+      }
+    }
 
     const merged = [];
     for (const m of mergeResult) {
-      const combined = { project: m.merged_name, topics: [] };
+      const combined = { project: sanitizeName(m.merged_name), topics: [] };
       for (const idx of m.original_indices) {
-        const orig = projects[idx - 1];
+        const orig = batchProjects[idx - 1];
         if (orig) combined.topics.push(...orig.topics);
       }
       if (combined.topics.length > 0) merged.push(combined);
     }
 
-    if (merged.length > 0 && merged.length < projects.length) {
-      // 话题去重
-      for (const p of merged) {
-        const map = new Map();
-        for (const t of p.topics) {
-          const existing = map.get(t.name);
-          if (existing) { existing.thread_ids.push(...t.thread_ids); }
-          else { map.set(t.name, { ...t }); }
-        }
-        p.topics = [...map.values()];
+    // 话题去重
+    for (const p of merged) {
+      const map = new Map();
+      for (const t of p.topics) {
+        const existing = map.get(t.name);
+        if (existing) { existing.thread_ids.push(...t.thread_ids); }
+        else { map.set(t.name, { ...t }); }
       }
+      p.topics = [...map.values()];
+    }
 
-      // 文件系统重组
-      for (const mp of merged) {
-        const mergedDir = path.join(EVENTS_DIR, folder, mp.project);
-        fs.mkdirSync(mergedDir, { recursive: true });
-        for (const topic of mp.topics) {
-          const targetDir = path.join(mergedDir, topic.name);
-          if (fs.existsSync(targetDir)) continue;
-          for (const origP of projects) {
-            const srcEvent = path.join(EVENTS_DIR, folder, origP.project, topic.name, 'event.md');
-            if (fs.existsSync(srcEvent)) {
-              fs.mkdirSync(targetDir, { recursive: true });
-              fs.copyFileSync(srcEvent, path.join(targetDir, 'event.md'));
-              break;
-            }
+    return merged;
+  }
+
+  // 第一轮：分批合并
+  console.log(`  项目合并 第一轮 (${projects.length} 个, 每批 ${MERGE_BATCH})...`);
+  let current = projects;
+
+  // 循环合并直到不超过 MERGE_BATCH 或者合并没有减少数量
+  let round = 1;
+  while (current.length > MERGE_BATCH) {
+    const roundResult = [];
+    for (let i = 0; i < current.length; i += MERGE_BATCH) {
+      const batch = current.slice(i, i + MERGE_BATCH);
+      if (batch.length <= 2) {
+        roundResult.push(...batch);
+        continue;
+      }
+      const label = `第${round}轮 批次${Math.floor(i / MERGE_BATCH) + 1}`;
+      console.log(`    ${label}: ${batch.length} 个项目...`);
+      const merged = await mergeBatch(batch, label);
+      console.log(`    ${label}: ${batch.length} → ${merged.length}`);
+      roundResult.push(...merged);
+    }
+
+    if (roundResult.length >= current.length) {
+      console.log(`  合并未减少 (${current.length} → ${roundResult.length})，停止`);
+      break;
+    }
+
+    console.log(`  第${round}轮完成: ${current.length} → ${roundResult.length}`);
+    current = roundResult;
+    round++;
+  }
+
+  // 最终合并（如果 <= MERGE_BATCH 且 > 3）
+  if (current.length > 3 && current.length <= MERGE_BATCH) {
+    console.log(`  最终合并: ${current.length} 个项目...`);
+    current = await mergeBatch(current, '最终');
+    console.log(`  最终结果: ${current.length} 个项目`);
+  }
+
+  if (current.length < projects.length) {
+    // 文件系统重组
+    for (const mp of current) {
+      const mergedDir = path.join(EVENTS_DIR, folder, mp.project);
+      fs.mkdirSync(mergedDir, { recursive: true });
+      for (const topic of mp.topics) {
+        const targetDir = path.join(mergedDir, topic.name);
+        if (fs.existsSync(targetDir)) continue;
+        for (const origP of projects) {
+          const srcEvent = path.join(EVENTS_DIR, folder, origP.project, topic.name, 'event.md');
+          if (fs.existsSync(srcEvent)) {
+            fs.mkdirSync(targetDir, { recursive: true });
+            fs.copyFileSync(srcEvent, path.join(targetDir, 'event.md'));
+            break;
           }
         }
-        const indexMd = generateProjectIndex(db, folder, mp.project, mp.topics);
-        writeFile(path.join(mergedDir, '_index.md'), indexMd);
       }
+      const indexMd = generateProjectIndex(db, folder, mp.project, mp.topics);
+      writeFile(path.join(mergedDir, '_index.md'), indexMd);
+    }
 
-      // 删除旧目录
-      for (const origP of projects) {
-        if (!merged.some(mp => mp.project === origP.project)) {
-          const oldDir = path.join(EVENTS_DIR, folder, origP.project);
-          if (fs.existsSync(oldDir)) fs.rmSync(oldDir, { recursive: true, force: true });
-        }
+    // 删除旧目录
+    for (const origP of projects) {
+      if (!current.some(mp => mp.project === origP.project)) {
+        const oldDir = path.join(EVENTS_DIR, folder, origP.project);
+        if (fs.existsSync(oldDir)) fs.rmSync(oldDir, { recursive: true, force: true });
       }
+    }
 
-      console.log(`  合并: ${projects.length} → ${merged.length}`);
-      return merged;
+    console.log(`  合并完成: ${projects.length} → ${current.length}`);
+    return current;
     }
   } catch (e) {
     console.log(`  合并失败: ${e.message.slice(0, 60)}`);

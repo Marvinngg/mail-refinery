@@ -47,7 +47,7 @@ async function main() {
   let needDownload = 0;
   for (const email of emails) {
     const atts = JSON.parse(email.attachments || '[]');
-    needDownload += atts.filter(a => !a.local_path && a.part).length;
+    needDownload += atts.filter(a => !a.local_path && (a.part || a._part)).length;
   }
 
   if (needDownload === 0) {
@@ -74,7 +74,8 @@ async function main() {
     let updated = false;
 
     for (const att of atts) {
-      if (att.local_path || !att.part) continue;
+      const partId = att.part || att._part;
+      if (att.local_path || !partId) continue;
 
       const targetPath = att._target_path || path.join(__dirname, 'data', 'attachments', email.folder, String(email.uid), att.name);
 
@@ -88,7 +89,7 @@ async function main() {
       try {
         const lock = await client.getMailboxLock(email.folder);
         try {
-          const buf = await downloadPart(client, email.uid, att.part);
+          const buf = await downloadPart(client, email.uid, partId);
           if (buf) {
             fs.mkdirSync(path.dirname(targetPath), { recursive: true });
             fs.writeFileSync(targetPath, buf);
