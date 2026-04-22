@@ -110,12 +110,13 @@ action 可以是：
 
 所有新线程都必须有归属。`;
 
-  try {
-    const response = await callModel(prompt);
-    return parseJSON(response);
-  } catch (e) {
-    console.log(`  分类失败: ${e.message.slice(0, 60)}`);
-    return [];
+  while (true) {
+    try {
+      const response = await callModel(prompt);
+      return parseJSON(response);
+    } catch (e) {
+      console.log(`  分类 JSON 解析失败，重试: ${e.message.slice(0, 60)}`);
+    }
   }
 }
 
