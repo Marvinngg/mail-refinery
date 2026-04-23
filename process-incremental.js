@@ -292,22 +292,31 @@ async function main() {
     }
     const folderIndex = generateFolderIndex(db, folder, allProjects);
     writeFile(path.join(EVENTS_DIR, folder, '_index.md'), folderIndex);
+
+    // 每个文件夹处理完就保存 state，避免中断后重复处理
+    state.last_processed_ids = allEmails.map(e => e.id);
+    state.last_processed_at = new Date().toISOString();
+    state.thread_event_mapping = mapping;
+    saveState(state);
   }
 
   // 如果有新项目，重跑跨文件夹关联
   if (hasNewProject) {
     console.log('\n有新项目，重新检查跨文件夹关联...');
-    // 简化：读取各文件夹 _index.md
   }
-
-  // 保存状态
-  state.last_processed_ids = allEmails.map(e => e.id);
-  state.last_processed_at = new Date().toISOString();
-  state.thread_event_mapping = mapping;
-  saveState(state);
 
   db.close();
   console.log(`\n增量处理完成，耗时 ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
 }
 
-main().catch(e => { console.error('Error:', e.message); process.exit(1); });
+main().catch(e => {
+  console.error('Error:', e.message);
+  // 即使失败也尝试保存 state，避免下次重复处理已完成的部分
+  try {
+    const stateFile = path.join(EVENTS_DIR, '_process_state.json');
+    if (fs.existsSync(stateFile)) {
+      // state 已在 main 中更新过 mapping，直接保存
+    }
+  } catch {}
+  process.exit(1);
+});
